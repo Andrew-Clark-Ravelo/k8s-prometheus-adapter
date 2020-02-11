@@ -72,11 +72,12 @@ type metricsQuery struct {
 
 // queryTemplateArgs contains the arguments for the template used in metricsQuery.
 type queryTemplateArgs struct {
-	Series            string
-	LabelMatchers     string
-	LabelValuesByName map[string]string
-	GroupBy           string
-	GroupBySlice      []string
+	Series             string
+	LabelMatchers      string
+	LabelMatcherByName map[string]string
+	LabelValuesByName  map[string]string
+	GroupBy            string
+	GroupBySlice       []string
 }
 
 type queryPart struct {
@@ -87,6 +88,7 @@ type queryPart struct {
 
 func (q *metricsQuery) Build(series string, resource schema.GroupResource, namespace string, extraGroupBy []string, names ...string) (prom.Selector, error) {
 	var exprs []string
+	exprByName := map[string]string{}
 	valuesByName := map[string]string{}
 
 	if namespace != "" {
@@ -118,11 +120,12 @@ func (q *metricsQuery) Build(series string, resource schema.GroupResource, names
 	groupBy = append(groupBy, extraGroupBy...)
 
 	args := queryTemplateArgs{
-		Series:            series,
-		LabelMatchers:     strings.Join(exprs, ","),
-		LabelValuesByName: valuesByName,
-		GroupBy:           strings.Join(groupBy, ","),
-		GroupBySlice:      groupBy,
+		Series:             series,
+		LabelMatchers:      strings.Join(exprs, ","),
+		LabelMatcherByName: exprByName,
+		LabelValuesByName:  valuesByName,
+		GroupBy:            strings.Join(groupBy, ","),
+		GroupBySlice:       groupBy,
 	}
 	queryBuff := new(bytes.Buffer)
 	if err := q.template.Execute(queryBuff, args); err != nil {
@@ -156,18 +159,19 @@ func (q *metricsQuery) BuildExternal(seriesName string, namespace string, groupB
 	}
 
 	// Convert our query parts into the types we need for our template.
-	exprs, valuesByName, err := q.processQueryParts(queryParts)
+	exprs, exprByName, valuesByName, err := q.processQueryParts(queryParts)
 
 	if err != nil {
 		return "", err
 	}
 
 	args := queryTemplateArgs{
-		Series:            seriesName,
-		LabelMatchers:     strings.Join(exprs, ","),
-		LabelValuesByName: valuesByName,
-		GroupBy:           groupBy,
-		GroupBySlice:      groupBySlice,
+		Series:             seriesName,
+		LabelMatchers:      strings.Join(exprs, ","),
+		LabelMatcherByName: exprByName,
+		LabelValuesByName:  valuesByName,
+		GroupBy:            groupBy,
+		GroupBySlice:       groupBySlice,
 	}
 
 	queryBuff := new(bytes.Buffer)
@@ -206,7 +210,7 @@ func (q *metricsQuery) convertRequirement(requirement labels.Requirement) queryP
 	}
 }
 
-func (q *metricsQuery) processQueryParts(queryParts []queryPart) ([]string, map[string]string, error) {
+func (q *metricsQuery) processQueryParts(queryParts []queryPart) ([]string, map[string]string, map[string]string, error) {
 	// We've take the approach here that if we can't perfectly map their query into a Prometheus
 	// query that we should abandon the effort completely.
 	// The concern is that if we don't get a perfect match on their query parameters, the query result
@@ -221,35 +225,39 @@ func (q *metricsQuery) processQueryParts(queryParts []queryPart) ([]string, map[
 	// e.g. "some_label" => "value-one|value-two"
 	valuesByName := map[string]string{}
 
+	// Contains the label matcher
+	exprByName := map[string]string{}
+
 	// Convert our query parts into template arguments.
 	for _, qPart := range queryParts {
 		// Be resilient against bad inputs.
 		// We obviously can't generate label filters for these cases.
 		if qPart.labelName == "" {
-			return nil, nil, ErrLabelNotSpecified
+			return nil, nil, nil, ErrLabelNotSpecified
 		}
 
 		if !q.operatorIsSupported(qPart.operator) {
-			return nil, nil, ErrUnsupportedOperator
+			return nil, nil, nil, ErrUnsupportedOperator
 		}
 
 		matcher, err := q.selectMatcher(qPart.operator, qPart.values)
 
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		targetValue, err := q.selectTargetValue(qPart.operator, qPart.values)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 
 		expression := matcher(qPart.labelName, targetValue)
 		exprs = append(exprs, expression)
+		exprByName[qPart.labelName] = expression
 		valuesByName[qPart.labelName] = strings.Join(qPart.values, "|")
 	}
 
-	return exprs, valuesByName, nil
+	return exprs, exprByName, valuesByName, nil
 }
 
 func (q *metricsQuery) selectMatcher(operator selection.Operator, values []string) (func(string, string) string, error) {
