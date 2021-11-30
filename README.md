@@ -1,10 +1,9 @@
 # Prometheus Adapter for Kubernetes Metrics APIs
 
-[![Build Status](https://travis-ci.org/DirectXMan12/k8s-prometheus-adapter.svg?branch=master)](https://travis-ci.org/DirectXMan12/k8s-prometheus-adapter)
-
 This repository contains an implementation of the Kubernetes
-[resource metrics](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/instrumentation/resource-metrics-api.md) API and
-[custom metrics](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/instrumentation/custom-metrics-api.md) API.
+[resource metrics](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/instrumentation/resource-metrics-api.md),
+[custom metrics](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/instrumentation/custom-metrics-api.md), and
+[external metrics](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/instrumentation/external-metrics-api.md) APIs.
 
 This adapter is therefore suitable for use with the autoscaling/v2 Horizontal Pod Autoscaler in Kubernetes 1.6+.  
 It can also replace the [metrics server](https://github.com/kubernetes-incubator/metrics-server) on clusters that already run Prometheus and collect the appropriate metrics.
@@ -18,13 +17,23 @@ Quick Links
 
 Installation
 -------------
-If you're a helm user, a helm chart is listed on the Kubeapps Hub as [stable/prometheus-adapter](https://github.com/helm/charts/blob/master/stable/prometheus-adapter/README.md).
+If you're a helm user, a helm chart is listed on prometheus-community repository as [prometheus-community/prometheus-adapter](https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus-adapter).
 
 To install it with the release name `my-release`, run this Helm command:
 
 ```console
-$ helm install --name my-release stable/prometheus-adapter
+$ helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+$ helm repo update
+$ helm install --name my-release prometheus-community/prometheus-adapter
 ```
+
+Official images
+---
+All official images for releases after v0.8.4 are available in `k8s.gcr.io/prometheus-adapter/prometheus-adapter:$VERSION`. The project also maintains a [staging registry](https://console.cloud.google.com/gcr/images/k8s-staging-prometheus-adapter/GLOBAL/) where images for each commit from the master branch are published. You can use this registry if you need to test a version from a specific commit, or if you need to deploy a patch while waiting for a new release.
+
+Images for versions v0.8.4 and prior are only available in unofficial registries:
+* https://quay.io/repository/coreos/k8s-prometheus-adapter-amd64
+* https://hub.docker.com/r/directxman12/k8s-prometheus-adapter/
 
 Configuration
 -------------
@@ -44,11 +53,26 @@ adapter talks to Prometheus and the main Kubernetes cluster:
   in-cluster config.
 
 - `--metrics-relist-interval=<duration>`: This is the interval at which to
-  update the cache of available metrics from Prometheus.  Since the adapter
-  only lists metrics during discovery that exist between the current time and
-  the last discovery query, your relist interval should be equal to or larger
-  than your Prometheus scrape interval, otherwise your metrics will
-  occaisonally disappear from the adapter.
+  update the cache of available metrics from Prometheus. By default, this
+  value is set to 10 minutes.
+
+- `--metrics-max-age=<duration>`: This is the max age of the metrics to be
+  loaded from Prometheus. For example, when set to `10m`, it will query
+  Prometheus for metrics since 10m ago, and only those that has datapoints
+  within the time period will appear in the adapter. Therefore, the metrics-max-age
+  should be equal to or larger than your Prometheus' scrape interval,
+  or your metrics will occaisonally disappear from the adapter.
+  By default, this is set to be the same as metrics-relist-interval to avoid
+  some confusing behavior (See this [PR](https://github.com/kubernetes-sigs/prometheus-adapter/pull/230)).
+
+  Note: We recommend setting this only if you understand what is happening.
+  For example, this setting could be useful in cases where the scrape duration is
+  over a network call, e.g. pulling metrics from AWS CloudWatch, or Google Monitoring,
+  more specifically, Google Monitoring sometimes have delays on when data will show
+  up in their system after being sampled. This means that even if you scraped data
+  frequently, they might not show up soon. If you configured the relist interval to
+  a short period but without configuring this, you might not be able to see your
+  metrics in the adapter in certain scenarios.
 
 - `--prometheus-url=<url>`: This is the URL used to connect to Prometheus.
   It will eventually contain query parameters to configure the connection.
@@ -191,3 +215,12 @@ large as your collection interval.
 I have namespace prefixed metrics like `{ "name": "namespaces/node_memory_PageTables_bytes", "singularName": "", "namespaced": false, "kind": "MetricValueList", "verbs": [ "get" ] }`, but I get error `Error from server (InternalError): Internal error occurred: unable to list matching resources` when access with `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1/namespaces/*/node_memory_PageTables_bytes` .
 
 Actually namespace prefixed metrics are special, we should access them with `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1/namespaces/*/metrics/node_memory_PageTables_bytes`.
+
+## Community, discussion, contribution, and support
+
+Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/).
+
+You can reach the maintainers of this project at:
+
+- [Slack](http://slack.k8s.io/)
+- [Mailing List](https://groups.google.com/forum/#!forum/kubernetes-dev)

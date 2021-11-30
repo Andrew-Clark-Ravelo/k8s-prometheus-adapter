@@ -1,24 +1,23 @@
-module github.com/directxman12/k8s-prometheus-adapter
+module sigs.k8s.io/prometheus-adapter
 
-go 1.13
+go 1.16
 
 require (
-	github.com/emicklei/go-restful-swagger12 v0.0.0-20170926063155-7524189396c6 // indirect
-	github.com/inconshreveable/mousetrap v1.0.0 // indirect
-	github.com/kubernetes-incubator/custom-metrics-apiserver v0.0.0-20190918110929-3d9be26a50eb
-	github.com/kubernetes-incubator/metrics-server v0.3.6
-	github.com/onsi/ginkgo v1.10.1
-	github.com/onsi/gomega v1.7.0
-	github.com/prometheus/client_golang v0.9.2
-	github.com/prometheus/common v0.0.0-20181126121408-4724e9255275
-	github.com/spf13/cobra v0.0.3
-	github.com/stretchr/testify v1.4.0
-	gopkg.in/yaml.v2 v2.2.4
-	k8s.io/api v0.0.0-20190817021128-e14a4b1f5f84
-	k8s.io/apimachinery v0.0.0-20190817020851-f2f3a405f61d
-	k8s.io/apiserver v0.0.0-20190817022445-fd6150da8f40 // indirect
-	k8s.io/client-go v0.0.0-20190817021527-637fc595d17a
-	k8s.io/component-base v0.0.0-20190817022002-dd0e01d5790f
-	k8s.io/klog v0.3.1
-	k8s.io/metrics v0.0.0-20190817023635-63ee757b2e8b
+	github.com/onsi/ginkgo v1.16.4
+	github.com/onsi/gomega v1.15.0
+	github.com/prometheus/client_golang v1.11.0
+	github.com/prometheus/common v0.26.0
+	github.com/spf13/cobra v1.2.1
+	github.com/stretchr/testify v1.7.0
+	gopkg.in/yaml.v2 v2.4.0
+	k8s.io/api v0.22.0
+	k8s.io/apimachinery v0.22.0
+	k8s.io/apiserver v0.22.0
+	k8s.io/client-go v0.22.0
+	k8s.io/component-base v0.22.0
+	k8s.io/klog/v2 v2.9.0
+	k8s.io/kube-openapi v0.0.0-20210421082810-95288971da7e
+	k8s.io/metrics v0.22.0
+	sigs.k8s.io/custom-metrics-apiserver v1.22.0
+	sigs.k8s.io/metrics-server v0.5.0
 )

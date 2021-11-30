@@ -1,84 +1,97 @@
-REGISTRY?=directxman12
-IMAGE?=k8s-prometheus-adapter
-TEMP_DIR:=$(shell mktemp -d)
+REGISTRY?=gcr.io/k8s-staging-prometheus-adapter
+IMAGE=prometheus-adapter
 ARCH?=$(shell go env GOARCH)
 ALL_ARCH=amd64 arm arm64 ppc64le s390x
-ML_PLATFORMS=linux/amd64,linux/arm,linux/arm64,linux/ppc64le,linux/s390x
-OUT_DIR?=./_output
 
-VERSION?=latest
-GOIMAGE=golang:1.12
-GO111MODULE=on
-export GO111MODULE
+VERSION=$(shell cat VERSION)
+TAG_PREFIX=v
+TAG?=$(TAG_PREFIX)$(VERSION)
 
-ifeq ($(ARCH),amd64)
-	BASEIMAGE?=busybox
-endif
-ifeq ($(ARCH),arm)
-	BASEIMAGE?=armhf/busybox
-endif
-ifeq ($(ARCH),arm64)
-	BASEIMAGE?=aarch64/busybox
-endif
-ifeq ($(ARCH),ppc64le)
-	BASEIMAGE?=ppc64le/busybox
-endif
-ifeq ($(ARCH),s390x)
-	BASEIMAGE?=s390x/busybox
-endif
+GO_VERSION?=1.16.4
 
-.PHONY: all docker-build push-% push test verify-gofmt gofmt verify build-local-image
+.PHONY: all
+all: prometheus-adapter
 
-all: $(OUT_DIR)/$(ARCH)/adapter
+# Build
+# -----
 
-src_deps=$(shell find pkg cmd -type f -name "*.go")
-$(OUT_DIR)/%/adapter: $(src_deps)
-	CGO_ENABLED=0 GOARCH=$* go build -tags netgo -o $(OUT_DIR)/$*/adapter github.com/directxman12/k8s-prometheus-adapter/cmd/adapter
-	
-docker-build:
-	cp deploy/Dockerfile $(TEMP_DIR)
-	cd $(TEMP_DIR) && sed -i "s|BASEIMAGE|$(BASEIMAGE)|g" Dockerfile
+SRC_DEPS=$(shell find pkg cmd -type f -name "*.go")
 
-	docker run -it -v $(TEMP_DIR):/build -v $(shell pwd):/go/src/github.com/directxman12/k8s-prometheus-adapter -e GOARCH=$(ARCH) $(GOIMAGE) /bin/bash -c "\
-		CGO_ENABLED=0 go build -tags netgo -o /build/adapter github.com/directxman12/k8s-prometheus-adapter/cmd/adapter"
+prometheus-adapter: $(SRC_DEPS)
+	CGO_ENABLED=0 GOARCH=$(ARCH) go build sigs.k8s.io/prometheus-adapter/cmd/adapter
 
-	docker build -t $(REGISTRY)/$(IMAGE)-$(ARCH):$(VERSION) $(TEMP_DIR)
-	rm -rf $(TEMP_DIR)
+.PHONY: container
+container:
+	docker build -t $(REGISTRY)/$(IMAGE)-$(ARCH):$(TAG) --build-arg ARCH=$(ARCH) --build-arg GO_VERSION=$(GO_VERSION) .
 
-build-local-image: $(OUT_DIR)/$(ARCH)/adapter
-	cp deploy/Dockerfile $(TEMP_DIR)
-	cp  $(OUT_DIR)/$(ARCH)/adapter $(TEMP_DIR)
-	cd $(TEMP_DIR) && sed -i "s|BASEIMAGE|scratch|g" Dockerfile
-	docker build -t $(REGISTRY)/$(IMAGE)-$(ARCH):$(VERSION) $(TEMP_DIR)
-	rm -rf $(TEMP_DIR)
+# Container push
+# --------------
 
-push-%:
-	$(MAKE) ARCH=$* docker-build
-	docker push $(REGISTRY)/$(IMAGE)-$*:$(VERSION)
+PUSH_ARCH_TARGETS=$(addprefix push-,$(ALL_ARCH))
 
-push: ./manifest-tool $(addprefix push-,$(ALL_ARCH))
-	./manifest-tool push from-args --platforms $(ML_PLATFORMS) --template $(REGISTRY)/$(IMAGE)-ARCH:$(VERSION) --target $(REGISTRY)/$(IMAGE):$(VERSION)
+.PHONY: push
+push: container
+	docker push $(REGISTRY)/$(IMAGE)-$(ARCH):$(TAG)
 
-./manifest-tool:
-	curl -sSL https://github.com/estesp/manifest-tool/releases/download/v0.5.0/manifest-tool-linux-amd64 > manifest-tool
-	chmod +x manifest-tool
+push-all: $(PUSH_ARCH_TARGETS) push-multi-arch;
 
-vendor:
-	go mod tidy
-	go mod vendor
+.PHONY: $(PUSH_ARCH_TARGETS)
+$(PUSH_ARCH_TARGETS): push-%:
+	ARCH=$* $(MAKE) push
 
+.PHONY: push-multi-arch
+push-multi-arch: export DOCKER_CLI_EXPERIMENTAL = enabled
+push-multi-arch:
+	docker manifest create --amend $(REGISTRY)/$(IMAGE):$(TAG) $(shell echo $(ALL_ARCH) | sed -e "s~[^ ]*~$(REGISTRY)/$(IMAGE)\-&:$(TAG)~g")
+	@for arch in $(ALL_ARCH); do docker manifest annotate --arch $${arch} $(REGISTRY)/$(IMAGE):$(TAG) $(REGISTRY)/$(IMAGE)-$${arch}:$(TAG); done
+	docker manifest push --purge $(REGISTRY)/$(IMAGE):$(TAG)
+
+# Test
+# ----
+
+.PHONY: test
 test:
-	CGO_ENABLED=0 go test ./pkg/...
+	CGO_ENABLED=0 go test ./cmd/... ./pkg/...
 
+# Static analysis
+# ---------------
+
+.PHONY: verify
+verify: verify-gofmt verify-deps verify-generated test
+
+.PHONY: update
+update: update-generated
+
+# Format
+# ------
+
+.PHONY: verify-gofmt
 verify-gofmt:
 	./hack/gofmt-all.sh -v
 
+.PHONY: gofmt
 gofmt:
 	./hack/gofmt-all.sh
 
-go-mod:
-	go mod tidy
-	go mod vendor
-	go mod verify
+# Dependencies
+# ------------
 
-verify: verify-gofmt go-mod test
+.PHONY: verify-deps
+verify-deps:
+	go mod verify
+	go mod tidy
+	@git diff --exit-code -- go.mod go.sum
+
+# Generation
+# ----------
+
+generated_files=pkg/api/generated/openapi/zz_generated.openapi.go
+
+.PHONY: verify-generated
+verify-generated:
+	@git diff --exit-code -- $(generated_files)
+
+.PHONY: update-generated
+update-generated:
+	go install -mod=readonly k8s.io/kube-openapi/cmd/openapi-gen
+	$(GOPATH)/bin/openapi-gen --logtostderr -i k8s.io/metrics/pkg/apis/custom_metrics,k8s.io/metrics/pkg/apis/custom_metrics/v1beta1,k8s.io/metrics/pkg/apis/custom_metrics/v1beta2,k8s.io/metrics/pkg/apis/external_metrics,k8s.io/metrics/pkg/apis/external_metrics/v1beta1,k8s.io/metrics/pkg/apis/metrics,k8s.io/metrics/pkg/apis/metrics/v1beta1,k8s.io/apimachinery/pkg/apis/meta/v1,k8s.io/apimachinery/pkg/api/resource,k8s.io/apimachinery/pkg/version,k8s.io/api/core/v1 -h ./hack/boilerplate.go.txt -p ./pkg/api/generated/openapi -O zz_generated.openapi -o ./ -r /dev/null

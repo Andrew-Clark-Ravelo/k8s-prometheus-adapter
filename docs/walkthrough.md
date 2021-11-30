@@ -34,20 +34,23 @@ significantly different.
 In order to follow this walkthrough, you'll need container images for
 Prometheus and the custom metrics adapter.
 
-The [Prometheus Operator](https://coreos.com/operators/prometheus/docs/latest/),
+The [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator),
 makes it easy to get up and running with Prometheus.  This walkthrough
 will assume you're planning on doing that -- if you've deployed it by hand
 instead, you'll need to make a few adjustments to the way you expose
 metrics to Prometheus.
 
 The adapter has different images for each arch, which can be found at
-`directxman12/k8s-prometheus-adapter-${ARCH}`. For instance, if you're on
-an x86_64 machine, use the `directxman12/k8s-prometheus-adapter-amd64`
-image.
+`gcr.io/k8s-staging-prometheus-adapter/prometheus-adapter-${ARCH}`. For
+instance, if you're on an x86_64 machine, use
+`gcr.io/k8s-staging-prometheus-adapter/prometheus-adapter-amd64` image.
 
-If you're feeling adventurous, you can build the latest version of the
-custom metrics adapter by running `make docker-build` or `make
-build-local-image`.
+There is also an official multi arch image available at
+`k8s.gcr.io/prometheus-adapter/prometheus-adapter:${VERSION}`.
+
+If you're feeling adventurous, you can build the latest version of
+prometheus-adapter by running `make container` or get the latest image from the
+staging registry `gcr.io/k8s-staging-prometheus-adapter/prometheus-adapter`.
 
 Special thanks to [@luxas](https://github.com/luxas) for providing the
 demo application for this walkthrough.
@@ -94,9 +97,33 @@ spec:
 
 </details>
 
+<details>
+
+<summary>sample-app.service.yaml</summary>
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: sample-app
+  name: sample-app
+spec:
+  ports:
+  - name: http
+    port: 80
+    protocol: TCP
+    targetPort: 8080
+  selector:
+    app: sample-app
+  type: ClusterIP
+```
+
+</details>
+
 ```shell
 $ kubectl create -f sample-app.deploy.yaml
-$ kubectl create service clusterip sample-app --tcp=80:8080
+$ kubectl create -f sample-app.service.yaml
 ```
 
 Now, check your app, which exposes metrics and counts the number of
@@ -165,8 +192,8 @@ Prometheus adapter to serve metrics out of Prometheus.
 ### Launching Prometheus
 
 First, you'll need to deploy the Prometheus Operator.  Check out the
-[getting started
-guide](https://coreos.com/operators/prometheus/docs/latest/user-guides/getting-started.html)
+[quick start
+guide](https://github.com/prometheus-operator/prometheus-operator#quickstart)
 for the Operator to deploy a copy of Prometheus.
 
 This walkthrough assumes that Prometheus is deployed in the `prom`
@@ -198,7 +225,7 @@ spec:
   selector:
     matchLabels:
       app: sample-app
-  endpoints: 
+  endpoints:
   - port: http
 ```
 
@@ -335,7 +362,7 @@ You should see that it succesfully fetched the metric, but it hasn't tried
 to scale, since there's not traffic.
 
 Since your app is going to need to scale in response to traffic, generate
-some via cURL like above: 
+some via cURL like above:
 
 ```shell
 $ curl http://$(kubectl get service sample-app -o jsonpath='{ .spec.clusterIP }')/metrics

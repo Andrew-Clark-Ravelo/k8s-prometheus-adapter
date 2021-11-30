@@ -19,21 +19,25 @@ package resourceprovider
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
-	"github.com/kubernetes-incubator/metrics-server/pkg/provider"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	apitypes "k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	metrics "k8s.io/metrics/pkg/apis/metrics"
 
-	"github.com/directxman12/k8s-prometheus-adapter/pkg/client"
-	"github.com/directxman12/k8s-prometheus-adapter/pkg/config"
-	"github.com/directxman12/k8s-prometheus-adapter/pkg/naming"
+	"sigs.k8s.io/metrics-server/pkg/api"
+
+	"sigs.k8s.io/prometheus-adapter/pkg/client"
+	"sigs.k8s.io/prometheus-adapter/pkg/config"
+	"sigs.k8s.io/prometheus-adapter/pkg/naming"
+
 	pmodel "github.com/prometheus/common/model"
 )
 
@@ -81,7 +85,7 @@ type resourceQuery struct {
 }
 
 // NewProvider constructs a new MetricsProvider to provide resource metrics from Prometheus using the given rules.
-func NewProvider(prom client.Client, mapper apimeta.RESTMapper, cfg *config.ResourceRules) (provider.MetricsProvider, error) {
+func NewProvider(prom client.Client, mapper apimeta.RESTMapper, cfg *config.ResourceRules) (api.MetricsGetter, error) {
 	cpuQuery, err := newResourceQuery(cfg.CPU, mapper)
 	if err != nil {
 		return nil, fmt.Errorf("unable to construct querier for CPU metrics: %v", err)
@@ -118,10 +122,13 @@ type nsQueryResults struct {
 	err       error
 }
 
-// GetContainerMetrics implements the provider.MetricsProvider interface. It may return nil, nil, nil.
-func (p *resourceProvider) GetContainerMetrics(pods ...apitypes.NamespacedName) ([]provider.TimeInfo, [][]metrics.ContainerMetrics, error) {
+// GetPodMetrics implements the api.MetricsProvider interface.
+func (p *resourceProvider) GetPodMetrics(pods ...apitypes.NamespacedName) ([]api.TimeInfo, [][]metrics.ContainerMetrics, error) {
+	resTimes := make([]api.TimeInfo, len(pods))
+	resMetrics := make([][]metrics.ContainerMetrics, len(pods))
+
 	if len(pods) == 0 {
-		return nil, nil, nil
+		return resTimes, resMetrics, nil
 	}
 
 	// TODO(directxman12): figure out how well this scales if we go to list 1000+ pods
@@ -161,8 +168,6 @@ func (p *resourceProvider) GetContainerMetrics(pods ...apitypes.NamespacedName) 
 
 	// convert the unorganized per-container results into results grouped
 	// together by namespace, pod, and container
-	resTimes := make([]provider.TimeInfo, len(pods))
-	resMetrics := make([][]metrics.ContainerMetrics, len(pods))
 	for i, pod := range pods {
 		p.assignForPod(pod, resultsByNs, &resMetrics[i], &resTimes[i])
 	}
@@ -174,7 +179,7 @@ func (p *resourceProvider) GetContainerMetrics(pods ...apitypes.NamespacedName) 
 // from resultsByNs, and places them in MetricsProvider response format in resMetrics,
 // also recording the earliest time in resTime.  It will return without operating if
 // any data is missing.
-func (p *resourceProvider) assignForPod(pod apitypes.NamespacedName, resultsByNs map[string]nsQueryResults, resMetrics *[]metrics.ContainerMetrics, resTime *provider.TimeInfo) {
+func (p *resourceProvider) assignForPod(pod apitypes.NamespacedName, resultsByNs map[string]nsQueryResults, resMetrics *[]metrics.ContainerMetrics, resTime *api.TimeInfo) {
 	// check to make sure everything is present
 	nsRes, nsResPresent := resultsByNs[pod.Namespace]
 	if !nsResPresent {
@@ -225,8 +230,19 @@ func (p *resourceProvider) assignForPod(pod apitypes.NamespacedName, resultsByNs
 		}
 	}
 
+	// check for any containers that have either memory usage or CPU usage, but not both
+	for _, containerMetric := range containerMetrics {
+		_, hasMemory := containerMetric.Usage[corev1.ResourceMemory]
+		_, hasCPU := containerMetric.Usage[corev1.ResourceCPU]
+		if hasMemory && !hasCPU {
+			containerMetric.Usage[corev1.ResourceCPU] = *resource.NewMilliQuantity(int64(0), resource.BinarySI)
+		} else if hasCPU && !hasMemory {
+			containerMetric.Usage[corev1.ResourceMemory] = *resource.NewMilliQuantity(int64(0), resource.BinarySI)
+		}
+	}
+
 	// store the time in the final format
-	*resTime = provider.TimeInfo{
+	*resTime = api.TimeInfo{
 		Timestamp: earliestTs.Time(),
 		Window:    p.window,
 	}
@@ -239,10 +255,13 @@ func (p *resourceProvider) assignForPod(pod apitypes.NamespacedName, resultsByNs
 	*resMetrics = containerMetricsList
 }
 
-// GetNodeMetrics implements the provider.MetricsProvider interface. It may return nil, nil, nil.
-func (p *resourceProvider) GetNodeMetrics(nodes ...string) ([]provider.TimeInfo, []corev1.ResourceList, error) {
+// GetNodeMetrics implements the api.MetricsProvider interface.
+func (p *resourceProvider) GetNodeMetrics(nodes ...string) ([]api.TimeInfo, []corev1.ResourceList, error) {
+	resTimes := make([]api.TimeInfo, len(nodes))
+	resMetrics := make([]corev1.ResourceList, len(nodes))
+
 	if len(nodes) == 0 {
-		return nil, nil, nil
+		return resTimes, resMetrics, nil
 	}
 
 	now := pmodel.Now()
@@ -250,11 +269,9 @@ func (p *resourceProvider) GetNodeMetrics(nodes ...string) ([]provider.TimeInfo,
 	// run the actual query
 	qRes := p.queryBoth(now, nodeResource, "", nodes...)
 	if qRes.err != nil {
-		return nil, nil, qRes.err
+		klog.Errorf("failed querying node metrics: %v", qRes.err)
+		return resTimes, resMetrics, nil
 	}
-
-	resTimes := make([]provider.TimeInfo, len(nodes))
-	resMetrics := make([]corev1.ResourceList, len(nodes))
 
 	// organize the results
 	for i, nodeName := range nodes {
@@ -282,12 +299,12 @@ func (p *resourceProvider) GetNodeMetrics(nodes ...string) ([]provider.TimeInfo,
 		// use the earliest timestamp available (in order to be conservative
 		// when determining if metrics are tainted by startup)
 		if rawMem.Timestamp.Before(rawCPU.Timestamp) {
-			resTimes[i] = provider.TimeInfo{
+			resTimes[i] = api.TimeInfo{
 				Timestamp: rawMem.Timestamp.Time(),
 				Window:    p.window,
 			}
 		} else {
-			resTimes[i] = provider.TimeInfo{
+			resTimes[i] = api.TimeInfo{
 				Timestamp: rawCPU.Timestamp.Time(),
 				Window:    1 * time.Minute,
 			}
@@ -347,10 +364,10 @@ func (p *resourceProvider) runQuery(now pmodel.Time, queryInfo resourceQuery, re
 
 	// build the query, which needs the special "container" group by if this is for pod metrics
 	if resource == nodeResource {
-		query, err = queryInfo.nodeQuery.Build("", resource, namespace, nil, names...)
+		query, err = queryInfo.nodeQuery.Build("", resource, namespace, nil, labels.Everything(), names...)
 	} else {
 		extraGroupBy := []string{queryInfo.containerLabel}
-		query, err = queryInfo.contQuery.Build("", resource, namespace, extraGroupBy, names...)
+		query, err = queryInfo.contQuery.Build("", resource, namespace, extraGroupBy, labels.Everything(), names...)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("unable to construct query: %v", err)
@@ -374,13 +391,17 @@ func (p *resourceProvider) runQuery(now pmodel.Time, queryInfo resourceQuery, re
 
 	// associate the results back to each given pod or node
 	res := make(queryResults, len(*rawRes.Vector))
-	for _, val := range *rawRes.Vector {
-		if val == nil {
-			// skip empty values
+	for _, sample := range *rawRes.Vector {
+		// skip empty samples
+		if sample == nil {
 			continue
 		}
-		resKey := string(val.Metric[resourceLbl])
-		res[resKey] = append(res[resKey], val)
+		// replace NaN and negative values by zero
+		if math.IsNaN(float64(sample.Value)) || sample.Value < 0 {
+			sample.Value = 0
+		}
+		resKey := string(sample.Metric[resourceLbl])
+		res[resKey] = append(res[resKey], sample)
 	}
 
 	return res, nil

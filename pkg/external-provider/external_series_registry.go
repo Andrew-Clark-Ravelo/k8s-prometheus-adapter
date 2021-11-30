@@ -16,12 +16,13 @@ package provider
 import (
 	"sync"
 
-	"github.com/kubernetes-incubator/custom-metrics-apiserver/pkg/provider"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	prom "github.com/directxman12/k8s-prometheus-adapter/pkg/client"
-	"github.com/directxman12/k8s-prometheus-adapter/pkg/naming"
+	"sigs.k8s.io/custom-metrics-apiserver/pkg/provider"
+
+	prom "sigs.k8s.io/prometheus-adapter/pkg/client"
+	"sigs.k8s.io/prometheus-adapter/pkg/naming"
 )
 
 // ExternalSeriesRegistry acts as the top-level converter for transforming Kubernetes requests

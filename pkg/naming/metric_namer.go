@@ -24,8 +24,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	prom "github.com/directxman12/k8s-prometheus-adapter/pkg/client"
-	"github.com/directxman12/k8s-prometheus-adapter/pkg/config"
+	prom "sigs.k8s.io/prometheus-adapter/pkg/client"
+	"sigs.k8s.io/prometheus-adapter/pkg/config"
 )
 
 // MetricNamer knows how to convert Prometheus series names and label names to
@@ -45,7 +45,7 @@ type MetricNamer interface {
 	MetricNameForSeries(series prom.Series) (string, error)
 	// QueryForSeries returns the query for a given series (not API metric name), with
 	// the given namespace name (if relevant), resource, and resource names.
-	QueryForSeries(series string, resource schema.GroupResource, namespace string, names ...string) (prom.Selector, error)
+	QueryForSeries(series string, resource schema.GroupResource, namespace string, metricSelector labels.Selector, names ...string) (prom.Selector, error)
 	// QueryForExternalSeries returns the query for a given series (not API metric name), with
 	// the given namespace name (if relevant), resource, and resource names.
 	QueryForExternalSeries(series string, namespace string, targetLabels labels.Selector) (prom.Selector, error)
@@ -126,13 +126,11 @@ SeriesLoop:
 	return finalSeries
 }
 
-func (n *metricNamer) QueryForSeries(series string, resource schema.GroupResource, namespace string, names ...string) (prom.Selector, error) {
-	return n.metricsQuery.Build(series, resource, namespace, nil, names...)
+func (n *metricNamer) QueryForSeries(series string, resource schema.GroupResource, namespace string, metricSelector labels.Selector, names ...string) (prom.Selector, error) {
+	return n.metricsQuery.Build(series, resource, namespace, nil, metricSelector, names...)
 }
 
 func (n *metricNamer) QueryForExternalSeries(series string, namespace string, metricSelector labels.Selector) (prom.Selector, error) {
-	//test := prom.Selector()
-	//return test, nil
 	return n.metricsQuery.BuildExternal(series, namespace, "", []string{}, metricSelector)
 }
 
@@ -155,7 +153,13 @@ func NamersFromConfig(cfg []config.DiscoveryRule, mapper apimeta.RESTMapper) ([]
 			return nil, err
 		}
 
-		metricsQuery, err := NewMetricsQuery(rule.MetricsQuery, resConv)
+		// queries are namespaced by default unless the rule specifically disables it
+		namespaced := true
+		if rule.Resources.Namespaced != nil {
+			namespaced = *rule.Resources.Namespaced
+		}
+
+		metricsQuery, err := NewExternalMetricsQuery(rule.MetricsQuery, resConv, namespaced)
 		if err != nil {
 			return nil, fmt.Errorf("unable to construct metrics query associated with series query %q: %v", rule.SeriesQuery, err)
 		}

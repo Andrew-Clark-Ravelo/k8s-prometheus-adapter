@@ -25,25 +25,34 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
-	basecmd "github.com/kubernetes-incubator/custom-metrics-apiserver/pkg/cmd"
-	"github.com/kubernetes-incubator/custom-metrics-apiserver/pkg/provider"
-	resmetrics "github.com/kubernetes-incubator/metrics-server/pkg/apiserver/generic"
-	"k8s.io/apimachinery/pkg/util/wait"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/transport"
 	"k8s.io/component-base/logs"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	prom "github.com/directxman12/k8s-prometheus-adapter/pkg/client"
-	mprom "github.com/directxman12/k8s-prometheus-adapter/pkg/client/metrics"
-	adaptercfg "github.com/directxman12/k8s-prometheus-adapter/pkg/config"
-	cmprov "github.com/directxman12/k8s-prometheus-adapter/pkg/custom-provider"
-	extprov "github.com/directxman12/k8s-prometheus-adapter/pkg/external-provider"
-	"github.com/directxman12/k8s-prometheus-adapter/pkg/naming"
-	resprov "github.com/directxman12/k8s-prometheus-adapter/pkg/resourceprovider"
+	customexternalmetrics "sigs.k8s.io/custom-metrics-apiserver/pkg/apiserver"
+	basecmd "sigs.k8s.io/custom-metrics-apiserver/pkg/cmd"
+	"sigs.k8s.io/custom-metrics-apiserver/pkg/provider"
+	"sigs.k8s.io/metrics-server/pkg/api"
+
+	generatedopenapi "sigs.k8s.io/prometheus-adapter/pkg/api/generated/openapi"
+	prom "sigs.k8s.io/prometheus-adapter/pkg/client"
+	mprom "sigs.k8s.io/prometheus-adapter/pkg/client/metrics"
+	adaptercfg "sigs.k8s.io/prometheus-adapter/pkg/config"
+	cmprov "sigs.k8s.io/prometheus-adapter/pkg/custom-provider"
+	extprov "sigs.k8s.io/prometheus-adapter/pkg/external-provider"
+	"sigs.k8s.io/prometheus-adapter/pkg/naming"
+	resprov "sigs.k8s.io/prometheus-adapter/pkg/resourceprovider"
 )
 
 type PrometheusAdapter struct {
@@ -57,8 +66,14 @@ type PrometheusAdapter struct {
 	PrometheusAuthConf string
 	// PrometheusCAFile points to the file containing the ca-root for connecting with Prometheus
 	PrometheusCAFile string
+	// PrometheusClientTLSCertFile points to the file containing the client TLS cert for connecting with Prometheus
+	PrometheusClientTLSCertFile string
+	// PrometheusClientTLSKeyFile points to the file containing the client TLS key for connecting with Prometheus
+	PrometheusClientTLSKeyFile string
 	// PrometheusTokenFile points to the file that contains the bearer token when connecting with Prometheus
 	PrometheusTokenFile string
+	// PrometheusHeaders is a k=v list of headers to set on requests to PrometheusURL
+	PrometheusHeaders []string
 	// AdapterConfigFile points to the file containing the metrics discovery configuration.
 	AdapterConfigFile string
 	// MetricsRelistInterval is the interval at which to relist the set of available metrics
@@ -78,7 +93,7 @@ func (cmd *PrometheusAdapter) makePromClient() (prom.Client, error) {
 	var httpClient *http.Client
 
 	if cmd.PrometheusCAFile != "" {
-		prometheusCAClient, err := makePrometheusCAClient(cmd.PrometheusCAFile)
+		prometheusCAClient, err := makePrometheusCAClient(cmd.PrometheusCAFile, cmd.PrometheusClientTLSCertFile, cmd.PrometheusClientTLSKeyFile)
 		if err != nil {
 			return nil, err
 		}
@@ -100,8 +115,7 @@ func (cmd *PrometheusAdapter) makePromClient() (prom.Client, error) {
 		}
 		httpClient.Transport = transport.NewBearerAuthRoundTripper(string(data), httpClient.Transport)
 	}
-
-	genericPromClient := prom.NewGenericAPIClient(httpClient, baseURL)
+	genericPromClient := prom.NewGenericAPIClient(httpClient, baseURL, parseHeaderArgs(cmd.PrometheusHeaders))
 	instrumentedGenericPromClient := mprom.InstrumentGenericAPIClient(genericPromClient, baseURL.String())
 	return prom.NewClientForAPI(instrumentedGenericPromClient), nil
 }
@@ -115,8 +129,14 @@ func (cmd *PrometheusAdapter) addFlags() {
 		"kubeconfig file used to configure auth when connecting to Prometheus.")
 	cmd.Flags().StringVar(&cmd.PrometheusCAFile, "prometheus-ca-file", cmd.PrometheusCAFile,
 		"Optional CA file to use when connecting with Prometheus")
+	cmd.Flags().StringVar(&cmd.PrometheusClientTLSCertFile, "prometheus-client-tls-cert-file", cmd.PrometheusClientTLSCertFile,
+		"Optional client TLS cert file to use when connecting with Prometheus, auto-renewal is not supported")
+	cmd.Flags().StringVar(&cmd.PrometheusClientTLSKeyFile, "prometheus-client-tls-key-file", cmd.PrometheusClientTLSKeyFile,
+		"Optional client TLS key file to use when connecting with Prometheus, auto-renewal is not supported")
 	cmd.Flags().StringVar(&cmd.PrometheusTokenFile, "prometheus-token-file", cmd.PrometheusTokenFile,
 		"Optional file containing the bearer token to use when connecting with Prometheus")
+	cmd.Flags().StringArrayVar(&cmd.PrometheusHeaders, "prometheus-header", cmd.PrometheusHeaders,
+		"Optional header to set on requests to prometheus-url. Can be repeated")
 	cmd.Flags().StringVar(&cmd.AdapterConfigFile, "config", cmd.AdapterConfigFile,
 		"Configuration file containing details of how to transform between Prometheus metrics "+
 			"and custom metrics API resources")
@@ -191,13 +211,13 @@ func (cmd *PrometheusAdapter) makeExternalProvider(promClient prom.Client, stopC
 	}
 
 	// construct the provider and start it
-	emProvider, runner := extprov.NewExternalPrometheusProvider(promClient, namers, cmd.MetricsRelistInterval)
+	emProvider, runner := extprov.NewExternalPrometheusProvider(promClient, namers, cmd.MetricsRelistInterval, cmd.MetricsMaxAge)
 	runner.RunUntil(stopCh)
 
 	return emProvider, nil
 }
 
-func (cmd *PrometheusAdapter) addResourceMetricsAPI(promClient prom.Client) error {
+func (cmd *PrometheusAdapter) addResourceMetricsAPI(promClient prom.Client, stopCh <-chan struct{}) error {
 	if cmd.metricsConfig.ResourceRules == nil {
 		// bail if we don't have rules for setting things up
 		return nil
@@ -213,11 +233,22 @@ func (cmd *PrometheusAdapter) addResourceMetricsAPI(promClient prom.Client) erro
 		return fmt.Errorf("unable to construct resource metrics API provider: %v", err)
 	}
 
-	provCfg := &resmetrics.ProviderConfig{
-		Node: provider,
-		Pod:  provider,
+	rest, err := cmd.ClientConfig()
+	if err != nil {
+		return err
 	}
-	informers, err := cmd.Informers()
+
+	client, err := kubernetes.NewForConfig(rest)
+	if err != nil {
+		return err
+	}
+
+	podInformerFactory := informers.NewFilteredSharedInformerFactory(client, 0, corev1.NamespaceAll, func(options *metav1.ListOptions) {
+		options.FieldSelector = "status.phase=Running"
+	})
+	podInformer := podInformerFactory.Core().V1().Pods()
+
+	informer, err := cmd.Informers()
 	if err != nil {
 		return err
 	}
@@ -227,9 +258,11 @@ func (cmd *PrometheusAdapter) addResourceMetricsAPI(promClient prom.Client) erro
 		return err
 	}
 
-	if err := resmetrics.InstallStorage(provCfg, informers.Core().V1(), server.GenericAPIServer); err != nil {
+	if err := api.Install(provider, podInformer.Lister(), informer.Core().V1().Nodes().Lister(), server.GenericAPIServer); err != nil {
 		return err
 	}
+
+	go podInformer.Informer().Run(stopCh)
 
 	return nil
 }
@@ -242,13 +275,22 @@ func main() {
 	cmd := &PrometheusAdapter{
 		PrometheusURL:         "https://localhost",
 		MetricsRelistInterval: 10 * time.Minute,
-		MetricsMaxAge:         20 * time.Minute,
 	}
 	cmd.Name = "prometheus-metrics-adapter"
+
+	cmd.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(generatedopenapi.GetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(api.Scheme, customexternalmetrics.Scheme))
+	cmd.OpenAPIConfig.Info.Title = "prometheus-metrics-adapter"
+	cmd.OpenAPIConfig.Info.Version = "1.0.0"
+
 	cmd.addFlags()
 	cmd.Flags().AddGoFlagSet(flag.CommandLine) // make sure we get the klog flags
 	if err := cmd.Flags().Parse(os.Args); err != nil {
 		klog.Fatalf("unable to parse flags: %v", err)
+	}
+
+	// if --metrics-max-age is not set, make it equal to --metrics-relist-interval
+	if cmd.MetricsMaxAge == 0*time.Second {
+		cmd.MetricsMaxAge = cmd.MetricsRelistInterval
 	}
 
 	// make the prometheus client
@@ -262,8 +304,11 @@ func main() {
 		klog.Fatalf("unable to load metrics discovery config: %v", err)
 	}
 
+	// stop channel closed on SIGTERM and SIGINT
+	stopCh := genericapiserver.SetupSignalHandler()
+
 	// construct the provider
-	cmProvider, err := cmd.makeProvider(promClient, wait.NeverStop)
+	cmProvider, err := cmd.makeProvider(promClient, stopCh)
 	if err != nil {
 		klog.Fatalf("unable to construct custom metrics provider: %v", err)
 	}
@@ -274,7 +319,7 @@ func main() {
 	}
 
 	// construct the external provider
-	emProvider, err := cmd.makeExternalProvider(promClient, wait.NeverStop)
+	emProvider, err := cmd.makeExternalProvider(promClient, stopCh)
 	if err != nil {
 		klog.Fatalf("unable to construct external metrics provider: %v", err)
 	}
@@ -285,12 +330,12 @@ func main() {
 	}
 
 	// attach resource metrics support, if it's needed
-	if err := cmd.addResourceMetricsAPI(promClient); err != nil {
+	if err := cmd.addResourceMetricsAPI(promClient, stopCh); err != nil {
 		klog.Fatalf("unable to install resource metrics API: %v", err)
 	}
 
 	// run the server
-	if err := cmd.Run(wait.NeverStop); err != nil {
+	if err := cmd.Run(stopCh); err != nil {
 		klog.Fatalf("unable to run custom metrics adapter: %v", err)
 	}
 }
@@ -314,7 +359,7 @@ func makeKubeconfigHTTPClient(inClusterAuth bool, kubeConfigPath string) (*http.
 		loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
 		authConf, err = loader.ClientConfig()
 		if err != nil {
-			return nil, fmt.Errorf("unable to construct  auth configuration from %q for connecting to Prometheus: %v", kubeConfigPath, err)
+			return nil, fmt.Errorf("unable to construct auth configuration from %q for connecting to Prometheus: %v", kubeConfigPath, err)
 		}
 	} else {
 		var err error
@@ -330,8 +375,8 @@ func makeKubeconfigHTTPClient(inClusterAuth bool, kubeConfigPath string) (*http.
 	return &http.Client{Transport: tr}, nil
 }
 
-func makePrometheusCAClient(caFilename string) (*http.Client, error) {
-	data, err := ioutil.ReadFile(caFilename)
+func makePrometheusCAClient(caFilePath string, tlsCertFilePath string, tlsKeyFilePath string) (*http.Client, error) {
+	data, err := ioutil.ReadFile(caFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read prometheus-ca-file: %v", err)
 	}
@@ -341,6 +386,21 @@ func makePrometheusCAClient(caFilename string) (*http.Client, error) {
 		return nil, fmt.Errorf("no certs found in prometheus-ca-file")
 	}
 
+	if (tlsCertFilePath != "") && (tlsKeyFilePath != "") {
+		tlsClientCerts, err := tls.LoadX509KeyPair(tlsCertFilePath, tlsKeyFilePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read TLS key pair: %v", err)
+		}
+		return &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					RootCAs:      pool,
+					Certificates: []tls.Certificate{tlsClientCerts},
+				},
+			},
+		}, nil
+	}
+
 	return &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
@@ -348,4 +408,17 @@ func makePrometheusCAClient(caFilename string) (*http.Client, error) {
 			},
 		},
 	}, nil
+}
+
+func parseHeaderArgs(args []string) http.Header {
+	headers := make(http.Header, len(args))
+	for _, h := range args {
+		parts := strings.SplitN(h, "=", 2)
+		value := ""
+		if len(parts) > 1 {
+			value = parts[1]
+		}
+		headers.Add(parts[0], value)
+	}
+	return headers
 }

@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
 
-	prom "github.com/directxman12/k8s-prometheus-adapter/pkg/client"
+	prom "sigs.k8s.io/prometheus-adapter/pkg/client"
 )
 
 // MetricsQuery represents a compiled metrics query for some set of
@@ -39,7 +39,7 @@ type MetricsQuery interface {
 	// is considered to be root-scoped.  extraGroupBy may be used for cases
 	// where we need to scope down more specifically than just the group-resource
 	// (e.g. container metrics).
-	Build(series string, groupRes schema.GroupResource, namespace string, extraGroupBy []string, resourceNames ...string) (prom.Selector, error)
+	Build(series string, groupRes schema.GroupResource, namespace string, extraGroupBy []string, metricSelector labels.Selector, resourceNames ...string) (prom.Selector, error)
 	BuildExternal(seriesName string, namespace string, groupBy string, groupBySlice []string, metricSelector labels.Selector) (prom.Selector, error)
 }
 
@@ -59,6 +59,27 @@ func NewMetricsQuery(queryTemplate string, resourceConverter ResourceConverter) 
 	return &metricsQuery{
 		resConverter: resourceConverter,
 		template:     templ,
+		namespaced:   true,
+	}, nil
+}
+
+// NewExternalMetricsQuery constructs a new MetricsQuery by compiling the given Go template.
+// The delimiters on the template are `<<` and `>>`, and it may use the following fields:
+// - Series: the series in question
+// - LabelMatchers: a pre-stringified form of the label matchers for the resources in the query
+// - LabelMatchersByName: the raw map-form of the above matchers
+// - GroupBy: the group-by clause to use for the resources in the query (stringified)
+// - GroupBySlice: the raw slice form of the above group-by clause
+func NewExternalMetricsQuery(queryTemplate string, resourceConverter ResourceConverter, namespaced bool) (MetricsQuery, error) {
+	templ, err := template.New("metrics-query").Delims("<<", ">>").Parse(queryTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse metrics query template %q: %v", queryTemplate, err)
+	}
+
+	return &metricsQuery{
+		resConverter: resourceConverter,
+		template:     templ,
+		namespaced:   namespaced,
 	}, nil
 }
 
@@ -68,6 +89,7 @@ func NewMetricsQuery(queryTemplate string, resourceConverter ResourceConverter) 
 type metricsQuery struct {
 	resConverter ResourceConverter
 	template     *template.Template
+	namespaced   bool
 }
 
 // queryTemplateArgs contains the arguments for the template used in metricsQuery.
@@ -86,18 +108,25 @@ type queryPart struct {
 	operator  selection.Operator
 }
 
-func (q *metricsQuery) Build(series string, resource schema.GroupResource, namespace string, extraGroupBy []string, names ...string) (prom.Selector, error) {
-	var exprs []string
-	exprByName := map[string]string{}
-	valuesByName := map[string]string{}
+func (q *metricsQuery) Build(series string, resource schema.GroupResource, namespace string, extraGroupBy []string, metricSelector labels.Selector, names ...string) (prom.Selector, error) {
+	queryParts := q.createQueryPartsFromSelector(metricSelector)
 
 	if namespace != "" {
 		namespaceLbl, err := q.resConverter.LabelForResource(NsGroupResource)
 		if err != nil {
 			return "", err
 		}
-		exprs = append(exprs, prom.LabelEq(string(namespaceLbl), namespace))
-		valuesByName[string(namespaceLbl)] = namespace
+
+		queryParts = append(queryParts, queryPart{
+			labelName: string(namespaceLbl),
+			values:    []string{namespace},
+			operator:  selection.Equals,
+		})
+	}
+
+	exprs, exprByName, valuesByName, err := q.processQueryParts(queryParts)
+	if err != nil {
+		return "", err
 	}
 
 	resourceLbl, err := q.resConverter.LabelForResource(resource)
@@ -145,7 +174,7 @@ func (q *metricsQuery) BuildExternal(seriesName string, namespace string, groupB
 	// Build up the query parts from the selector.
 	queryParts = append(queryParts, q.createQueryPartsFromSelector(metricSelector)...)
 
-	if namespace != "" {
+	if q.namespaced && namespace != "" {
 		namespaceLbl, err := q.resConverter.LabelForResource(NsGroupResource)
 		if err != nil {
 			return "", err
