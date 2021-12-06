@@ -60,12 +60,11 @@ func (b *ctx) append(prefix string) *ctx {
 
 // ReadVal copy the underlying JSON into go interface, same as json.Unmarshal
 func (iter *Iterator) ReadVal(obj interface{}) {
-	depth := iter.depth
 	cacheKey := reflect2.RTypeOf(obj)
 	decoder := iter.cfg.getDecoderFromCache(cacheKey)
 	if decoder == nil {
 		typ := reflect2.TypeOf(obj)
-		if typ == nil || typ.Kind() != reflect.Ptr {
+		if typ.Kind() != reflect.Ptr {
 			iter.ReportError("ReadVal", "can only unmarshal into pointer")
 			return
 		}
@@ -77,10 +76,6 @@ func (iter *Iterator) ReadVal(obj interface{}) {
 		return
 	}
 	decoder.Decode(ptr, iter)
-	if iter.depth != depth {
-		iter.ReportError("ReadVal", "unexpected mismatched nesting")
-		return
-	}
 }
 
 // WriteVal copy the go interface into underlying JSON, same as json.Marshal
@@ -125,8 +120,7 @@ func decoderOfType(ctx *ctx, typ reflect2.Type) ValDecoder {
 	for _, extension := range extensions {
 		decoder = extension.DecorateDecoder(typ, decoder)
 	}
-	decoder = ctx.decoderExtension.DecorateDecoder(typ, decoder)
-	for _, extension := range ctx.extraExtensions {
+	for _, extension := range ctx.extensions {
 		decoder = extension.DecorateDecoder(typ, decoder)
 	}
 	return decoder
@@ -228,8 +222,7 @@ func encoderOfType(ctx *ctx, typ reflect2.Type) ValEncoder {
 	for _, extension := range extensions {
 		encoder = extension.DecorateEncoder(typ, encoder)
 	}
-	encoder = ctx.encoderExtension.DecorateEncoder(typ, encoder)
-	for _, extension := range ctx.extraExtensions {
+	for _, extension := range ctx.extensions {
 		encoder = extension.DecorateEncoder(typ, encoder)
 	}
 	return encoder

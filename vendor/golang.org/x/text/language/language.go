@@ -412,10 +412,6 @@ func (t Tag) Extensions() []Extension {
 // are of the allowed values defined for the Unicode locale extension ('u') in
 // https://www.unicode.org/reports/tr35/#Unicode_Language_and_Locale_Identifiers.
 // TypeForKey will traverse the inheritance chain to get the correct value.
-//
-// If there are multiple types associated with a key, only the first will be
-// returned. If there is no type associated with a key, it returns the empty
-// string.
 func (t Tag) TypeForKey(key string) string {
 	if !compact.Tag(t).MayHaveExtensions() {
 		if key != "rg" && key != "va" {
@@ -534,7 +530,7 @@ func (r Region) String() string {
 // Note that not all regions have a 3-letter ISO code.
 // In such cases this method returns "ZZZ".
 func (r Region) ISO3() string {
-	return r.regionID.ISO3()
+	return r.regionID.String()
 }
 
 // M49 returns the UN M.49 encoding of r, or 0 if this encoding
