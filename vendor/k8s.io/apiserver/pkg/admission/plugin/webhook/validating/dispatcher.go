@@ -22,7 +22,8 @@ import (
 	"sync"
 	"time"
 
-	v1 "k8s.io/api/admissionregistration/v1"
+	admissionv1beta1 "k8s.io/api/admission/v1beta1"
+	"k8s.io/api/admissionregistration/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -31,21 +32,10 @@ import (
 	"k8s.io/apiserver/pkg/admission/plugin/webhook"
 	webhookerrors "k8s.io/apiserver/pkg/admission/plugin/webhook/errors"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
-	webhookrequest "k8s.io/apiserver/pkg/admission/plugin/webhook/request"
+	"k8s.io/apiserver/pkg/admission/plugin/webhook/request"
+	"k8s.io/apiserver/pkg/admission/plugin/webhook/util"
 	webhookutil "k8s.io/apiserver/pkg/util/webhook"
-	"k8s.io/apiserver/pkg/warning"
-	"k8s.io/klog/v2"
-	utiltrace "k8s.io/utils/trace"
-)
-
-const (
-	// ValidatingAuditAnnotationPrefix is a prefix for keeping noteworthy
-	// validating audit annotations.
-	ValidatingAuditAnnotationPrefix = "validating.webhook.admission.k8s.io/"
-	// ValidatingAuditAnnotationFailedOpenKeyPrefix in an annotation indicates
-	// the validating webhook failed open when the webhook backend connection
-	// failed or returned an internal server error.
-	ValidatingAuditAnnotationFailedOpenKeyPrefix = "failed-open." + ValidatingAuditAnnotationPrefix
+	"k8s.io/klog"
 )
 
 type validatingDispatcher struct {
@@ -90,59 +80,29 @@ func (d *validatingDispatcher) Dispatch(ctx context.Context, attr admission.Attr
 		return nil
 	}
 
-	// Check if the request has already timed out before spawning remote calls
-	select {
-	case <-ctx.Done():
-		// parent context is canceled or timed out, no point in continuing
-		return apierrors.NewTimeoutError("request did not complete within requested timeout", 0)
-	default:
-	}
-
 	wg := sync.WaitGroup{}
 	errCh := make(chan error, len(relevantHooks))
 	wg.Add(len(relevantHooks))
 	for i := range relevantHooks {
-		go func(invocation *generic.WebhookInvocation, idx int) {
+		go func(invocation *generic.WebhookInvocation) {
 			defer wg.Done()
 			hook, ok := invocation.Webhook.GetValidatingWebhook()
 			if !ok {
-				utilruntime.HandleError(fmt.Errorf("validating webhook dispatch requires v1.ValidatingWebhook, but got %T", hook))
+				utilruntime.HandleError(fmt.Errorf("validating webhook dispatch requires v1beta1.ValidatingWebhook, but got %T", hook))
 				return
 			}
 			versionedAttr := versionedAttrs[invocation.Kind]
 			t := time.Now()
 			err := d.callHook(ctx, hook, invocation, versionedAttr)
-			ignoreClientCallFailures := hook.FailurePolicy != nil && *hook.FailurePolicy == v1.Ignore
-			rejected := false
-			if err != nil {
-				switch err := err.(type) {
-				case *webhookutil.ErrCallingWebhook:
-					if !ignoreClientCallFailures {
-						rejected = true
-						admissionmetrics.Metrics.ObserveWebhookRejection(ctx, hook.Name, "validating", string(versionedAttr.Attributes.GetOperation()), admissionmetrics.WebhookRejectionCallingWebhookError, 0)
-					}
-				case *webhookutil.ErrWebhookRejection:
-					rejected = true
-					admissionmetrics.Metrics.ObserveWebhookRejection(ctx, hook.Name, "validating", string(versionedAttr.Attributes.GetOperation()), admissionmetrics.WebhookRejectionNoError, int(err.Status.ErrStatus.Code))
-				default:
-					rejected = true
-					admissionmetrics.Metrics.ObserveWebhookRejection(ctx, hook.Name, "validating", string(versionedAttr.Attributes.GetOperation()), admissionmetrics.WebhookRejectionAPIServerInternalError, 0)
-				}
-			}
-			admissionmetrics.Metrics.ObserveWebhook(ctx, time.Since(t), rejected, versionedAttr.Attributes, "validating", hook.Name)
+			admissionmetrics.Metrics.ObserveWebhook(time.Since(t), err != nil, versionedAttr.Attributes, "validating", hook.Name)
 			if err == nil {
 				return
 			}
 
+			ignoreClientCallFailures := hook.FailurePolicy != nil && *hook.FailurePolicy == v1beta1.Ignore
 			if callErr, ok := err.(*webhookutil.ErrCallingWebhook); ok {
 				if ignoreClientCallFailures {
 					klog.Warningf("Failed calling webhook, failing open %v: %v", hook.Name, callErr)
-
-					key := fmt.Sprintf("%sround_0_index_%d", ValidatingAuditAnnotationFailedOpenKeyPrefix, idx)
-					value := hook.Name
-					if err := versionedAttr.Attributes.AddAnnotation(key, value); err != nil {
-						klog.Warningf("Failed to set admission audit annotation %s to %s for validating webhook %s: %v", key, value, hook.Name, err)
-					}
 					utilruntime.HandleError(callErr)
 					return
 				}
@@ -152,12 +112,9 @@ func (d *validatingDispatcher) Dispatch(ctx context.Context, attr admission.Attr
 				return
 			}
 
-			if rejectionErr, ok := err.(*webhookutil.ErrWebhookRejection); ok {
-				err = rejectionErr.Status
-			}
 			klog.Warningf("rejected by webhook %q: %#v", hook.Name, err)
 			errCh <- err
-		}(relevantHooks[i], i)
+		}(relevantHooks[i])
 	}
 	wg.Wait()
 	close(errCh)
@@ -178,77 +135,48 @@ func (d *validatingDispatcher) Dispatch(ctx context.Context, attr admission.Attr
 	return errs[0]
 }
 
-func (d *validatingDispatcher) callHook(ctx context.Context, h *v1.ValidatingWebhook, invocation *generic.WebhookInvocation, attr *generic.VersionedAttributes) error {
+func (d *validatingDispatcher) callHook(ctx context.Context, h *v1beta1.ValidatingWebhook, invocation *generic.WebhookInvocation, attr *generic.VersionedAttributes) error {
 	if attr.Attributes.IsDryRun() {
 		if h.SideEffects == nil {
 			return &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: fmt.Errorf("Webhook SideEffects is nil")}
 		}
-		if !(*h.SideEffects == v1.SideEffectClassNone || *h.SideEffects == v1.SideEffectClassNoneOnDryRun) {
+		if !(*h.SideEffects == v1beta1.SideEffectClassNone || *h.SideEffects == v1beta1.SideEffectClassNoneOnDryRun) {
 			return webhookerrors.NewDryRunUnsupportedErr(h.Name)
 		}
 	}
 
-	uid, request, response, err := webhookrequest.CreateAdmissionObjects(attr, invocation)
-	if err != nil {
-		return &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: err}
+	// Currently dispatcher only supports `v1beta1` AdmissionReview
+	// TODO: Make the dispatcher capable of sending multiple AdmissionReview versions
+	if !util.HasAdmissionReviewVersion(v1beta1.SchemeGroupVersion.Version, invocation.Webhook) {
+		return &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: fmt.Errorf("webhook does not accept v1beta1 AdmissionReviewRequest")}
 	}
+
 	// Make the webhook request
-	client, err := invocation.Webhook.GetRESTClient(d.cm)
+	request := request.CreateAdmissionReview(attr, invocation)
+	client, err := d.cm.HookClient(util.HookClientConfigForWebhook(invocation.Webhook))
 	if err != nil {
 		return &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: err}
 	}
-	trace := utiltrace.New("Call validating webhook",
-		utiltrace.Field{"configuration", invocation.Webhook.GetConfigurationName()},
-		utiltrace.Field{"webhook", h.Name},
-		utiltrace.Field{"resource", attr.GetResource()},
-		utiltrace.Field{"subresource", attr.GetSubresource()},
-		utiltrace.Field{"operation", attr.GetOperation()},
-		utiltrace.Field{"UID", uid})
-	defer trace.LogIfLong(500 * time.Millisecond)
-
-	// if the webhook has a specific timeout, wrap the context to apply it
+	response := &admissionv1beta1.AdmissionReview{}
+	r := client.Post().Context(ctx).Body(&request)
 	if h.TimeoutSeconds != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(*h.TimeoutSeconds)*time.Second)
-		defer cancel()
+		r = r.Timeout(time.Duration(*h.TimeoutSeconds) * time.Second)
 	}
-
-	r := client.Post().Body(request)
-
-	// if the context has a deadline, set it as a parameter to inform the backend
-	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
-		// compute the timeout
-		if timeout := time.Until(deadline); timeout > 0 {
-			// if it's not an even number of seconds, round up to the nearest second
-			if truncated := timeout.Truncate(time.Second); truncated != timeout {
-				timeout = truncated + time.Second
-			}
-			// set the timeout
-			r.Timeout(timeout)
-		}
-	}
-
-	if err := r.Do(ctx).Into(response); err != nil {
-		return &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: err}
-	}
-	trace.Step("Request completed")
-
-	result, err := webhookrequest.VerifyAdmissionResponse(uid, false, response)
-	if err != nil {
+	if err := r.Do().Into(response); err != nil {
 		return &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: err}
 	}
 
-	for k, v := range result.AuditAnnotations {
+	if response.Response == nil {
+		return &webhookutil.ErrCallingWebhook{WebhookName: h.Name, Reason: fmt.Errorf("Webhook response was absent")}
+	}
+	for k, v := range response.Response.AuditAnnotations {
 		key := h.Name + "/" + k
 		if err := attr.Attributes.AddAnnotation(key, v); err != nil {
 			klog.Warningf("Failed to set admission audit annotation %s to %s for validating webhook %s: %v", key, v, h.Name, err)
 		}
 	}
-	for _, w := range result.Warnings {
-		warning.AddWarning(ctx, "", w)
-	}
-	if result.Allowed {
+	if response.Response.Allowed {
 		return nil
 	}
-	return &webhookutil.ErrWebhookRejection{Status: webhookerrors.ToStatusErr(h.Name, result.Result)}
+	return webhookerrors.ToStatusErr(h.Name, response.Response.Result)
 }

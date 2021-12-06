@@ -17,7 +17,6 @@ limitations under the License.
 package namespace
 
 import (
-	"context"
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -77,7 +76,7 @@ func (m *Matcher) GetNamespaceLabels(attr admission.Attributes) (map[string]stri
 	}
 	if apierrors.IsNotFound(err) {
 		// in case of latency in our caches, make a call direct to storage to verify that it truly exists or not
-		namespace, err = m.Client.CoreV1().Namespaces().Get(context.TODO(), namespaceName, metav1.GetOptions{})
+		namespace, err = m.Client.CoreV1().Namespaces().Get(namespaceName, metav1.GetOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -96,7 +95,8 @@ func (m *Matcher) MatchNamespaceSelector(h webhook.WebhookAccessor, attr admissi
 		// Also update the comment in types.go
 		return true, nil
 	}
-	selector, err := h.GetParsedNamespaceSelector()
+	// TODO: adding an LRU cache to cache the translation
+	selector, err := metav1.LabelSelectorAsSelector(h.GetNamespaceSelector())
 	if err != nil {
 		return false, apierrors.NewInternalError(err)
 	}

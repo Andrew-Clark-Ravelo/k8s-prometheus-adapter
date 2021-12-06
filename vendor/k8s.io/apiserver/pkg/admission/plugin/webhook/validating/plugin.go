@@ -17,7 +17,6 @@ limitations under the License.
 package validating
 
 import (
-	"context"
 	"io"
 
 	"k8s.io/apiserver/pkg/admission"
@@ -62,6 +61,6 @@ func NewValidatingAdmissionWebhook(configFile io.Reader) (*Plugin, error) {
 }
 
 // Validate makes an admission decision based on the request attributes.
-func (a *Plugin) Validate(ctx context.Context, attr admission.Attributes, o admission.ObjectInterfaces) error {
-	return a.Webhook.Dispatch(ctx, attr, o)
+func (a *Plugin) Validate(attr admission.Attributes, o admission.ObjectInterfaces) error {
+	return a.Webhook.Dispatch(attr, o)
 }
